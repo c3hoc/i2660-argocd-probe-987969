@@ -1,0 +1,37 @@
+{
+ "apiVersion": "v1",
+ "kind": "Pod",
+ "metadata": {
+  "name": "i3084-stage-probe-61e3ae",
+  "namespace": "argocd",
+  "labels": {
+   "i3084": "61e3ae"
+  }
+ },
+ "spec": {
+  "restartPolicy": "Never",
+  "containers": [
+   {
+    "name": "probe",
+    "image": "alpine:3.20",
+    "command": [
+     "/bin/sh",
+     "-c"
+    ],
+    "args": [
+     "#!/bin/sh\nset -u\necho \"===I3084_START utc=$(date -u +%FT%TZ)===\"\napk add --no-cache curl >/tmp/apk.log 2>&1; echo \"apk_rc=$?\"\nfor H in labels.sandbox01.shifamedcloud.ai mlflow.dev01.lazamedical.ai labels.dev01.lazamedical.ai; do\n  echo \"===DNS $H===\"; getent hosts \"$H\" || echo DNS_FAIL\n  echo \"===CURL $H===\"\n  curl -k -m 10 -sS -o /dev/null -w \"code=%{http_code} ip=%{remote_ip} time=%{time_total}\" \"https://$H/\" 2>&1 | head -c 400; echo \" rc=$?\"\ndone\necho \"===RESOLVE labels.sandbox01 -> 34.209.230.239===\"\ncurl -k -m 10 -sS --resolve labels.sandbox01.shifamedcloud.ai:443:34.209.230.239 -o /dev/null -w \"code=%{http_code} ip=%{remote_ip} time=%{time_total}\" \"https://labels.sandbox01.shifamedcloud.ai/\" 2>&1 | head -c 400; echo \" rc=$?\"\necho \"===MLFLOW_HEALTH===\"\ncurl -k -m 10 -sS -o /dev/null -w \"code=%{http_code} ip=%{remote_ip}\" \"https://mlflow.dev01.lazamedical.ai/health\" 2>&1 | head -c 400; echo \" rc=$?\"\necho \"===MLFLOW_ALB===\"\ncurl -k -m 10 -sS -o /dev/null -w \"code=%{http_code} ip=%{remote_ip}\" \"https://lazamedical-dp-dev01-usw2-mlf-2120029784.us-west-2.elb.amazonaws.com/health\" 2>&1 | head -c 400; echo \" rc=$?\"\necho \"===SANDBOX_IP_HTTP80===\"\ncurl -m 10 -sS -o /dev/null -w \"code=%{http_code} ip=%{remote_ip}\" \"http://34.209.230.239/\" -H \"Host: labels.sandbox01.shifamedcloud.ai\" 2>&1 | head -c 400; echo \" rc=$?\"\necho \"===I3084_DONE $(date -u +%FT%TZ)===\"\n"
+    ],
+    "resources": {
+     "requests": {
+      "cpu": "50m",
+      "memory": "64Mi"
+     },
+     "limits": {
+      "cpu": "500m",
+      "memory": "512Mi"
+     }
+    }
+   }
+  ]
+ }
+}
