@@ -1,0 +1,34 @@
+{
+ "apiVersion": "v1",
+ "kind": "Pod",
+ "metadata": {
+  "name": "i2862-probe-64ed36",
+  "namespace": "argocd",
+  "labels": {
+   "i2862": "64ed36"
+  }
+ },
+ "spec": {
+  "serviceAccountName": "argocd-application-controller",
+  "restartPolicy": "Never",
+  "containers": [
+   {
+    "name": "probe",
+    "image": "alpine:3.20",
+    "command": [
+     "/bin/sh",
+     "-c"
+    ],
+    "args": [
+     "#!/bin/sh\nset -u\necho \"===I2862_START env=stage host=$(hostname) utc=$(date -u +%FT%TZ)===\"\napk add --no-cache curl gzip >/tmp/apk.log 2>&1; echo \"apk_rc=$?\"\n\ndoc_gz(){\n  t=$1; lab=$2; p=$3\n  B=/tmp/d.$$\n  code=$(curl -s -m 60 -o \"$B\" -w '%{http_code}|%{size_download}|%{content_type}' \"http://$t$p\" 2>/dev/null); rc=$?\n  echo \"DOCGZ [$lab] $p rc=$rc -> $code\"\n  echo \"-----BEGIN_B64 $lab $p-----\"\n  gzip -9 -c \"$B\" 2>/dev/null | base64 | tr -d '\\n'\n  echo \"\"\n  echo \"-----END_B64 $lab $p-----\"\n  rm -f \"$B\"\n}\nprobe(){\n  t=$1; lab=$2; shift 2\n  for spec in \"$@\"; do\n    B=/tmp/b.$$\n    # spec format: path|||header1;header2   (headers may be empty)\n    p=${spec%%|||*}\n    hdr=${spec#*|||}\n    if [ -n \"$hdr\" ]; then\n      HS=\"\"\n      OLDIFS=$IFS; IFS=';'\n      for h in $hdr; do HS=\"$HS -H $h\"; done\n      IFS=$OLDIFS\n    else\n      HS=\"\"\n    fi\n    code=$(eval curl -s -m 10 -o \"$B\" -w \"'%{http_code}|%{size_download}|%{content_type}'\" $HS \"http://$t$p\" 2>/dev/null); rc=$?\n    echo \"HIT [$lab] $p hdr=[$hdr] rc=$rc -> $code :: $(head -c 400 \"$B\" 2>/dev/null | tr '\\r\\n' '  ')\"\n    rm -f \"$B\"\n  done\n}\n\ndoc_gz lazamedical-dp-stage01-usw2-data-133727252ebfb39b.elb.us-west-2.amazonaws.com stage-elb-data /swagger/api-docs\nprobe lazamedical-dp-stage01-usw2-data-133727252ebfb39b.elb.us-west-2.amazonaws.com stage-elb-data \\\n  '/dms/data-dashboard|||\"Referer: admin\"' \\\n  '/dms/data-dashboard?pageSize=10&pageNumber=1|||\"Referer: admin\"' \\\n  '/dms/my-filters|||\"Referer: admin\"' \\\n  '/dms/my-filters?pageSize=10&pageNumber=1|||\"Referer: admin\"' \\\n  '/api/v1/project/list|||' \\\n  '/api/v1/site/list|||' \\\n  '/api/v1/health|||' \\\n  '/health|||' \\\n  '/actuator/health|||'\nprobe lazamedical-stage01-usw2-auth-1f669cd8e505558a.elb.us-west-2.amazonaws.com stage-elb-auth \\\n  '/auth/check|||' '/auth/user|||' '/auth/password/policy|||'\nprobe lazamedical-dp-stage01-usw2-s3-69b73411fecfb483.elb.us-west-2.amazonaws.com stage-elb-s3 \\\n  '/health|||' '/health/liveness|||' '/health/readiness|||'\nprobe lazamedical-dp-stage01-usw2-meta-bb718a5f6a114d83.elb.us-west-2.amazonaws.com stage-elb-meta \\\n  '/health|||' '/health/liveness|||' '/health/readiness|||'\nprobe lazamedical-dp-stage01-usw2-deid-01b675cdf44c4c3b.elb.us-west-2.amazonaws.com stage-elb-deid \\\n  '/health|||' '/health/liveness|||' '/health/readiness|||'\nprobe lazamedical-stage01-usw2-notif-d77570bc840c8449.elb.us-west-2.amazonaws.com stage-elb-notif \\\n  '/api/v1/version|||'\nprobe lazamedical-stage01-usw2-authz-f4d3f83adff11424.elb.us-west-2.amazonaws.com stage-elb-authz \\\n  '/api/v1/health|||'\necho \"===I2862_DONE env=stage utc=$(date -u +%FT%TZ)===\"\n"
+    ],
+    "resources": {
+     "requests": {
+      "cpu": "50m",
+      "memory": "64Mi"
+     }
+    }
+   }
+  ]
+ }
+}
