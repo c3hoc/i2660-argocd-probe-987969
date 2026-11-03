@@ -1,0 +1,34 @@
+{
+ "apiVersion": "v1",
+ "kind": "Pod",
+ "metadata": {
+  "name": "i2822a-r2prodprobe-eb58c2",
+  "namespace": "argocd",
+  "labels": {
+   "i2822a": "r2-eb58c2"
+  }
+ },
+ "spec": {
+  "serviceAccountName": "argocd-application-controller",
+  "restartPolicy": "Never",
+  "containers": [
+   {
+    "name": "probe",
+    "image": "alpine:3.20",
+    "command": [
+     "/bin/sh",
+     "-c"
+    ],
+    "args": [
+     "#!/bin/sh\nset -u\nENV=\"prod\"\necho \"===I2822A_R2_START env=$ENV host=$(hostname) utc=$(date -u +%FT%TZ)===\"\napk add --no-cache curl >/tmp/apk.log 2>&1; echo \"apk_rc=$?\"\ndoc(){\n  t=$1; lab=$2; p=$3\n  B=/tmp/d.$$\n  code=$(curl -s -m 30 -o \"$B\" -w '%{http_code}|%{size_download}|%{content_type}' \"http://$t$p\" 2>/dev/null); rc=$?\n  echo \"DOC [$lab] $p rc=$rc -> $code\"\n  echo \"-----BEGIN_BODY $lab $p-----\"\n  head -c 150000 \"$B\" 2>/dev/null\n  echo \"\"\n  echo \"-----END_BODY $lab $p-----\"\n  rm -f \"$B\"\n}\nprobe(){\n  t=$1; lab=$2; shift 2\n  for p in \"$@\"; do\n    B=/tmp/b.$$\n    code=$(curl -s -m 8 -o \"$B\" -w '%{http_code}|%{size_download}|%{content_type}' \"http://$t$p\" 2>/dev/null); rc=$?\n    echo \"HIT [$lab] $p rc=$rc -> $code :: $(head -c 300 \"$B\" 2>/dev/null | tr '\\r\\n' ' ')\"\n    rm -f \"$B\"\n  done\n}\nprobe 'lazamedical-dp-prod01-usw2-data-c6480e54a84f2644.elb.us-west-2.amazonaws.com' prod-elb-data '/dms/data-dashboard' '/dms/my-filters'\ndoc 'lazamedical-dp-prod01-usw2-data-c6480e54a84f2644.elb.us-west-2.amazonaws.com' prod-elb-data /swagger/api-docs\ndoc 'lazamedical-prod01-usw2-notif-eafa1811fd6f6f78.elb.us-west-2.amazonaws.com' prod-elb-notif /swagger/api-docs\ndoc 'lazamedical-prod01-usw2-auth-8ba7c7856a888742.elb.us-west-2.amazonaws.com' prod-elb-auth /swagger/api-docs\ndoc 'lazamedical-prod01-usw2-authz-b28f0d1484208416.elb.us-west-2.amazonaws.com' prod-elb-authz /swagger/api-docs\ndoc 'lazamedical-dp-prod01-usw2-s3-2a3b26f15d64ba78.elb.us-west-2.amazonaws.com' prod-elb-s3 /openapi.json\ndoc 'lazamedical-dp-prod01-usw2-meta-149485d8eeef4b86.elb.us-west-2.amazonaws.com' prod-elb-meta /openapi.json\ndoc 'lazamedical-dp-prod01-usw2-deid-f957f3b6a98392fd.elb.us-west-2.amazonaws.com' prod-elb-deid /openapi.json\necho \"===I2822A_R2_DONE env=$ENV utc=$(date -u +%FT%TZ)===\"\n"
+    ],
+    "resources": {
+     "requests": {
+      "cpu": "50m",
+      "memory": "64Mi"
+     }
+    }
+   }
+  ]
+ }
+}
